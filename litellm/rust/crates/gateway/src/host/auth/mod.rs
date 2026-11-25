@@ -208,17 +208,60 @@ impl AuthHost for NativeAuthHost {
         }
     }
 
-    async fn key_by_hash(&self, _: &KeyHash) -> Result<Option<MappedKey<Key>>, Error> {
-        declined("key_by_hash")
+    async fn key_by_hash(&self, hash: &KeyHash) -> Result<Option<MappedKey<Key>>, Error> {
+        let Some(store) = &self.keys else {
+            return declined("key_by_hash");
+        };
+        let cached = match Box::pin(store.cached(hash)).await {
+            Some(key) => Some(key),
+            None => match Box::pin(store.loaded(hash)).await {
+                Ok(key) => key,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %litellm_error::Report::new(&error),
+                        "a mapped virtual key was not read from the database"
+                    );
+                    return Err(Error::HostFailed);
+                }
+            },
+        };
+        let Some(cached) = cached else {
+            return declined("key_by_hash");
+        };
+        let Some(key) = keyed(&cached)? else {
+            return declined("key_by_hash");
+        };
+        Ok(Some(MappedKey {
+            key,
+            user_email: None,
+        }))
     }
 
     async fn key_mapping_hash(
         &self,
-        _: &str,
-        _: &str,
-        _: Option<&str>,
+        claim_field: &str,
+        claim_value: &str,
+        issuer: Option<&str>,
     ) -> Result<Option<KeyHash>, Error> {
-        declined("key_mapping_hash")
+        let Some(store) = &self.keys else {
+            return declined("key_mapping_hash");
+        };
+        let Some(result) = store
+            .key_mapping_hash(claim_field, claim_value, issuer)
+            .await
+        else {
+            return declined("key_mapping_hash");
+        };
+        match result {
+            Ok(hash) => Ok(hash),
+            Err(error) => {
+                tracing::warn!(
+                    error = %litellm_error::Report::new(&error),
+                    "a JWT key mapping was not read from the database"
+                );
+                Err(Error::HostFailed)
+            }
+        }
     }
 
     async fn reusable_key_hash(&self, _: &str, _: Option<&str>) -> Result<Option<KeyHash>, Error> {
@@ -267,21 +310,32 @@ impl AuthHost for NativeAuthHost {
         Ok(())
     }
 
-    async fn cached_key_mapping(&self, _: MappedClaim<'_>) -> Result<Option<Value>, Error> {
-        declined("cached_key_mapping")
+    async fn cached_key_mapping(&self, claim: MappedClaim<'_>) -> Result<Option<Value>, Error> {
+        let Some(store) = &self.keys else {
+            return declined("cached_key_mapping");
+        };
+        Ok(store.cached_key_mapping(claim).await)
     }
 
     async fn cache_key_mapping(
         &self,
-        _: MappedClaim<'_>,
-        _: &Value,
-        _: Duration,
+        claim: MappedClaim<'_>,
+        value: &Value,
+        ttl: Duration,
     ) -> Result<(), Error> {
-        declined("cache_key_mapping")
+        let Some(store) = &self.keys else {
+            return declined("cache_key_mapping");
+        };
+        store.cache_key_mapping(claim, value, ttl).await;
+        Ok(())
     }
 
-    async fn forget_key_mapping(&self, _: MappedClaim<'_>) -> Result<(), Error> {
-        declined("forget_key_mapping")
+    async fn forget_key_mapping(&self, claim: MappedClaim<'_>) -> Result<(), Error> {
+        let Some(store) = &self.keys else {
+            return declined("forget_key_mapping");
+        };
+        store.forget_key_mapping(claim).await;
+        Ok(())
     }
 
     fn operator_hooks(&self) -> Option<&impl OperatorHooks> {
@@ -1218,5 +1272,178 @@ mod tests {
             matches!(disallowed, Rejected::InvalidToken),
             "{disallowed:?}"
         );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_jwt_the_database_maps_is_its_key_and_both_answers_are_cached() {
+        let held = Held::holding(VIRTUAL_KEY, json!({})).await;
+        let mapping = |value: &str| {
+            json!({
+                "id": value,
+                "jwt_issuer": "",
+                "jwt_claim_name": "client_id",
+                "jwt_claim_value": value,
+                "token": Token::new(VIRTUAL_KEY).hash().as_str(),
+                "is_active": true,
+                "created_at": "2026-01-01T00:00:00",
+                "updated_at": "2026-01-01T00:00:00",
+            })
+        };
+        held.insert("LiteLLM_JWTKeyMapping", &mapping("svc-a"))
+            .await;
+        let store = Arc::new(
+            AuthStore::new(keys::memory_cache(), held.database()).with_mappings(
+                litellm_repositories::JwtKeyMappingRepository::new(held.repositories()),
+            ),
+        );
+        let jwks_url = jwt::serve_jwks().await;
+        let env = move |name: &str| (name == "JWT_PUBLIC_KEY_URL").then(|| jwks_url.clone());
+        let gateway = auth_over(
+            &config(&format!(
+                "  master_key: {MASTER_KEY}\n  enable_jwt_auth: true\n  litellm_jwtauth:\n    virtual_key_claim_field: client_id\n"
+            )),
+            Some(store),
+            Some(Arc::new(JwtIo::new(litellm_http::Client::for_test()))),
+            true,
+            &env,
+        );
+        let presented =
+            |value: &str| jwt::issue(json!({"client_id": value}).as_object().unwrap(), 3600);
+        let is_mapped = |caller: &Authenticated<NativeRows>| {
+            matches!(
+                &caller.credential,
+                Credential::Key {
+                    via: litellm_gateway_auth_core::Via::MappedJwt(_),
+                    ..
+                }
+            ) && caller.hash() == Some(&Token::new(VIRTUAL_KEY).hash())
+        };
+
+        let first = (
+            bearing(&gateway, &presented("svc-a")).await.unwrap(),
+            bearing(&gateway, &presented("svc-b")).await.unwrap(),
+        );
+        held.execute(r#"DELETE FROM "LiteLLM_JWTKeyMapping""#).await;
+        held.insert("LiteLLM_JWTKeyMapping", &mapping("svc-b"))
+            .await;
+        let again = (
+            bearing(&gateway, &presented("svc-a")).await.unwrap(),
+            bearing(&gateway, &presented("svc-b")).await.unwrap(),
+        );
+
+        assert_eq!(
+            [&first.0, &first.1, &again.0, &again.1].map(is_mapped),
+            [true, false, true, false]
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_cached_mapping_whose_key_is_gone_goes_to_python() {
+        let held = Held::start().await;
+        let store = Arc::new(AuthStore::new(keys::memory_cache(), held.database()));
+        let claim = MappedClaim {
+            field: "client_id",
+            value: "svc-a",
+            issuer: None,
+        };
+        let missing = Value::String(Token::new(VIRTUAL_KEY).hash().as_str().to_owned());
+        store
+            .cache_key_mapping(claim, &missing, Duration::from_secs(60))
+            .await;
+        let jwks_url = jwt::serve_jwks().await;
+        let env = move |name: &str| (name == "JWT_PUBLIC_KEY_URL").then(|| jwks_url.clone());
+        let gateway = auth_over(
+            &config(&format!(
+                "  master_key: {MASTER_KEY}\n  enable_jwt_auth: true\n  litellm_jwtauth:\n    virtual_key_claim_field: client_id\n    unregistered_jwt_client_behavior: reject\n"
+            )),
+            Some(store),
+            Some(Arc::new(JwtIo::new(litellm_http::Client::for_test()))),
+            true,
+            &env,
+        );
+
+        let answered = bearing(
+            &gateway,
+            &jwt::issue(json!({"client_id": "svc-a"}).as_object().unwrap(), 3600),
+        )
+        .await;
+
+        assert!(
+            matches!(answered, Err(Rejected::NotNative)),
+            "{:?}",
+            answered.map(|caller| caller.credential.clone())
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn native_jwt_resolves_cached_key_mapping_into_via_mapped_jwt() {
+        let jwks_url = jwt::serve_jwks().await;
+        let config = Config::from_yaml(
+            "model_list: []\ngeneral_settings:\n  master_key: sk-master\n  enable_jwt_auth: true\n  litellm_jwtauth:\n    virtual_key_claim_field: client_id\n",
+        )
+        .unwrap();
+        let cache = keys::memory_cache();
+        cache
+            .set(
+                None,
+                &litellm_redis_store::auth_cache::AuthObject::Key(stored_hash()),
+                litellm_python_compat::Value::Dict(vec![(
+                    litellm_python_compat::Value::Str("token".to_owned()),
+                    litellm_python_compat::Value::Str(stored_hash()),
+                )]),
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+        let store = Arc::new(AuthStore::new(cache, keys::unreachable()));
+        let claim = MappedClaim {
+            field: "client_id",
+            value: "svc-a",
+            issuer: None,
+        };
+        store
+            .cache_key_mapping(
+                claim,
+                &Value::String(stored_hash()),
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let jwt_io = Arc::new(JwtIo::new(litellm_http::Client::for_test()));
+        let env = move |name: &str| (name == "JWT_PUBLIC_KEY_URL").then(|| jwks_url.clone());
+        let gateway = auth_over(&config, Some(store), Some(jwt_io), true, &env);
+
+        let now = jiff::Timestamp::now().as_second();
+        let token = jwt::sign(&serde_json::json!({
+            "client_id": "svc-a",
+            "exp": now + 3600,
+            "iat": now,
+        }));
+        let caller = bearing(&gateway, &token).await.unwrap();
+        assert_eq!(
+            caller.hash().map(KeyHash::as_str),
+            Some(stored_hash().as_str())
+        );
+        assert!(matches!(
+            caller.credential,
+            litellm_gateway_auth_core::Credential::Key {
+                via: litellm_gateway_auth_core::Via::MappedJwt(_),
+                ..
+            }
+        ));
+
+        let entra_token = jwt::sign(&serde_json::json!({
+            "client_id": "svc-a",
+            "iss": "https://login.microsoftonline.com/t1/v2.0",
+            "tid": "t1",
+            "azp": "app-1",
+            "exp": now + 3600,
+            "iat": now,
+        }));
+        let entra = bearing(&gateway, &entra_token).await.err().unwrap();
+        assert!(matches!(entra, Rejected::NotNative), "{entra:?}");
     }
 }
