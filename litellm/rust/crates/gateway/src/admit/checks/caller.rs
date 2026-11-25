@@ -9,6 +9,7 @@ pub(super) fn caller(_: &Admit, authentication: &Authentication) -> Option<Reaso
     match authentication {
         Ok(caller) => match &caller.credential {
             Credential::MasterKey | Credential::Key { .. } => None,
+            Credential::Jwt { .. } => Some(Reason::new(Refused::Credential, "not_native")),
         },
         Err(error) => Some(Reason::new(
             Refused::Credential,

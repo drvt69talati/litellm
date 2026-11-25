@@ -37,8 +37,8 @@ use crate::{Gateway, callbacks, callbacks::Callbacks};
 /// it was authenticated.
 pub(crate) fn layers(identity: &Authenticated<NativeRows>) -> impl Iterator<Item = Layer<'_>> {
     let key = match &identity.credential {
-        Credential::MasterKey => None,
-        Credential::Key { key } => Some(Layer::Key(key.models())),
+        Credential::MasterKey | Credential::Jwt { .. } => None,
+        Credential::Key { key, .. } => Some(Layer::Key(key.models())),
     };
     key.into_iter()
 }

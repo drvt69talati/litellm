@@ -43,9 +43,10 @@ fn stored_key() -> Caller<Held> {
                 token: Some(KeyHash::new("stored")),
                 ..KeyRecord::default()
             },
+            via: auth_core::Via::OwnToken,
         },
         affiliation: Affiliation::nobody(),
-        end_user: (),
+        end_user: None,
     }
 }
 
@@ -53,7 +54,7 @@ fn master_key() -> Caller<Held> {
     Caller {
         credential: auth_core::Credential::MasterKey,
         affiliation: Affiliation::nobody(),
-        end_user: (),
+        end_user: None,
     }
 }
 
