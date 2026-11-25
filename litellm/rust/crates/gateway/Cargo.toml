@@ -32,6 +32,7 @@ litellm-coroutine.workspace = true
 litellm-callbacks-budgets.workspace = true
 litellm-spend-log-writer.workspace = true
 parking_lot.workspace = true
+moka.workspace = true
 arc-swap.workspace = true
 litellm-config.workspace = true
 litellm-config-load.workspace = true
@@ -72,7 +73,9 @@ tower-http = { version = "0.6.11", features = ["catch-panic", "cors", "decompres
 uuid.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 chrono.workspace = true
+jsonwebtoken = { workspace = true, features = ["rust_crypto", "use_pem"] }
 litellm-gateway = { workspace = true, features = ["test-support"] }
 litellm-gateway-inference = { workspace = true, features = ["test-support"] }
 litellm-redis-testing.workspace = true

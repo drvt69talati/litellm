@@ -8,6 +8,7 @@
 //! A step this host does not answer yet declines, which sends the request to Python. A later
 //! change serves more keys by answering one more step.
 
+mod jwt_io;
 #[macro_use]
 mod key;
 mod store;
@@ -37,6 +38,7 @@ use litellm_gateway_auth_core::{
 use litellm_redis_store::auth_cache::KeyEntry;
 use serde_json::Value;
 
+pub use jwt_io::{JwtIo, client_config as jwt_client_config};
 pub use key::Key;
 pub use store::AuthStore;
 
@@ -65,6 +67,8 @@ pub struct NativeAuthHost {
     keys: Option<Arc<AuthStore>>,
     /// The hash Python caches the master key's identity under, which is no key row.
     master: Option<KeyHash>,
+    /// HTTP and document-cache IO for JWT verification (JWKS, OIDC discovery, UserInfo).
+    jwt_io: Option<Arc<JwtIo>>,
 }
 
 impl NativeAuthHost {
@@ -73,8 +77,18 @@ impl NativeAuthHost {
         Self {
             keys: None,
             master: None,
+            jwt_io: None,
         }
     }
+}
+
+fn is_entra_agent_candidate(claims: &Value) -> bool {
+    let Some(object) = claims.as_object() else {
+        return false;
+    };
+    ["iss", "tid", "azp"]
+        .into_iter()
+        .all(|field| object.get(field).is_some_and(Value::is_string))
 }
 
 /// The request needs `step`, which this host does not answer yet.
@@ -129,13 +143,15 @@ fn settings(config: &Config, database: bool, premium: bool, environment: &dyn Lo
 /// for `config`, the master key and with `keys` a virtual key read from them, taken from the
 /// header an inference client sends its key in.
 pub fn auth(config: &Config, keys: Option<Arc<AuthStore>>) -> Auth<NativeRows> {
-    auth_over(config, keys, false, &|_: &str| None)
+    auth_over(config, keys, None, false, &|_: &str| None)
 }
 
-/// Like [`auth`], with the license entitlement and environment lookup from `AppState`.
+/// Like [`auth`], with the JWT verification IO, license entitlement, and environment lookup from
+/// `AppState`.
 pub fn auth_over(
     config: &Config,
     keys: Option<Arc<AuthStore>>,
+    jwt_io: Option<Arc<JwtIo>>,
     premium: bool,
     environment: &dyn Lookup,
 ) -> Auth<NativeRows> {
@@ -143,6 +159,7 @@ pub fn auth_over(
     let host = NativeAuthHost {
         keys,
         master: master_key(config).map(|key| Token::new(key.clone()).hash()),
+        jwt_io,
     };
     let keys = CoreAuthenticator::new(host, settings, Arc::new(SystemClock));
     Auth::new(Arc::new(keys)).with_extractor(Arc::new(BearerOrXApiKey))
@@ -217,20 +234,37 @@ impl AuthHost for NativeAuthHost {
         Ok(())
     }
 
-    async fn fetch_json(&self, _: &str) -> Result<Option<Value>, Error> {
-        declined("fetch_json")
+    async fn fetch_json(&self, url: &str) -> Result<Option<Value>, Error> {
+        let Some(io) = &self.jwt_io else {
+            return declined("fetch_json");
+        };
+        io.fetch_json(url)
+            .await
+            .or_else(|jwt_io::Unusable| declined("fetch_json"))
     }
 
-    async fn fetch_userinfo(&self, _: &str, _: &Token) -> Result<Option<Value>, Error> {
-        declined("fetch_userinfo")
+    async fn fetch_userinfo(&self, endpoint: &str, token: &Token) -> Result<Option<Value>, Error> {
+        let Some(io) = &self.jwt_io else {
+            return declined("fetch_userinfo");
+        };
+        io.fetch_userinfo(endpoint, token)
+            .await
+            .or_else(|jwt_io::Unusable| declined("fetch_userinfo"))
     }
 
-    async fn cached_document(&self, _: &str) -> Result<Option<Value>, Error> {
-        declined("cached_document")
+    async fn cached_document(&self, key: &str) -> Result<Option<Value>, Error> {
+        let Some(io) = &self.jwt_io else {
+            return declined("cached_document");
+        };
+        Ok(io.cached_document(key).await)
     }
 
-    async fn cache_document(&self, _: &str, _: &Value, _: Duration) -> Result<(), Error> {
-        declined("cache_document")
+    async fn cache_document(&self, key: &str, value: &Value, ttl: Duration) -> Result<(), Error> {
+        let Some(io) = &self.jwt_io else {
+            return declined("cache_document");
+        };
+        io.cache_document(key, value, ttl).await;
+        Ok(())
     }
 
     async fn cached_key_mapping(&self, _: MappedClaim<'_>) -> Result<Option<Value>, Error> {
@@ -254,7 +288,13 @@ impl AuthHost for NativeAuthHost {
         None::<&NoOperatorCode>
     }
 
-    async fn managed_agent(&self, _: &Value) -> Result<Option<ManagedAgent<Infallible>>, Error> {
+    async fn managed_agent(
+        &self,
+        claims: &Value,
+    ) -> Result<Option<ManagedAgent<Infallible>>, Error> {
+        if !is_entra_agent_candidate(claims) {
+            return Ok(None);
+        }
         declined("managed_agent")
     }
 
@@ -440,6 +480,10 @@ impl AuthHost for NativeAuthHost {
 #[cfg(test)]
 #[path = "../../../tests/keys/mod.rs"]
 pub(crate) mod keys;
+
+#[cfg(test)]
+#[path = "../../../tests/jwt/mod.rs"]
+mod jwt;
 
 #[cfg(test)]
 mod tests {
@@ -1102,5 +1146,77 @@ mod tests {
         let reads = (read_at("sk-third", 2).await, read_at("sk-first", 2).await);
 
         assert_eq!(reads, expected);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn native_jwt_authenticates_proxy_admin_and_refuses_expired_and_declines_non_admin() {
+        let jwks_url = jwt::serve_jwks().await;
+        let config = Config::from_yaml(
+            "model_list: []\ngeneral_settings:\n  master_key: sk-master\n  enable_jwt_auth: true\n  litellm_jwtauth:\n    admin_allowed_routes:\n      - /v1/messages\n",
+        )
+        .unwrap();
+        let jwt_io = Arc::new(JwtIo::new(litellm_http::Client::for_test()));
+        let env = move |name: &str| (name == "JWT_PUBLIC_KEY_URL").then(|| jwks_url.clone());
+        let gateway = auth_over(&config, None, Some(jwt_io.clone()), true, &env);
+
+        let now = jiff::Timestamp::now().as_second();
+        let admin_token = jwt::sign(&serde_json::json!({
+            "scope": "litellm_proxy_admin",
+            "exp": now + 3600,
+            "iat": now,
+        }));
+        let admin = bearing(&gateway, &admin_token).await.unwrap();
+        assert_eq!(admin.role(), LitellmRole::ProxyAdmin);
+        assert!(matches!(
+            admin.credential,
+            litellm_gateway_auth_core::Credential::Jwt {
+                actor: litellm_gateway_auth_core::JwtActor::User {
+                    role: LitellmRole::ProxyAdmin,
+                },
+                ..
+            }
+        ));
+
+        let expired_token = jwt::sign(&serde_json::json!({
+            "scope": "litellm_proxy_admin",
+            "exp": now - 60,
+            "iat": now - 120,
+        }));
+        let expired = bearing(&gateway, &expired_token).await.err().unwrap();
+        assert!(matches!(expired, Rejected::Expired), "{expired:?}");
+
+        let user_token = jwt::sign(&serde_json::json!({
+            "sub": "user-123",
+            "exp": now + 3600,
+            "iat": now,
+        }));
+        let user = bearing(&gateway, &user_token).await.unwrap();
+        assert_eq!(user.role(), LitellmRole::InternalUser);
+
+        let team_config = Config::from_yaml(
+            "model_list: []\ngeneral_settings:\n  master_key: sk-master\n  enable_jwt_auth: true\n  litellm_jwtauth:\n    team_id_jwt_field: team_id\n",
+        )
+        .unwrap();
+        let team_gateway = auth_over(&team_config, None, Some(jwt_io.clone()), true, &env);
+        let team_token = jwt::sign(&serde_json::json!({
+            "sub": "user-123",
+            "team_id": "team-1",
+            "exp": now + 3600,
+            "iat": now,
+        }));
+        let needs_team = bearing(&team_gateway, &team_token).await.err().unwrap();
+        assert!(matches!(needs_team, Rejected::NotNative), "{needs_team:?}");
+
+        let default_routes = Config::from_yaml(
+            "model_list: []\ngeneral_settings:\n  master_key: sk-master\n  enable_jwt_auth: true\n",
+        )
+        .unwrap();
+        let restricted = auth_over(&default_routes, None, Some(jwt_io), true, &env);
+        let disallowed = bearing(&restricted, &admin_token).await.err().unwrap();
+        assert!(
+            matches!(disallowed, Rejected::InvalidToken),
+            "{disallowed:?}"
+        );
     }
 }

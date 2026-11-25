@@ -27,7 +27,10 @@ use crate::{
     callbacks::parallel_request_limiter,
     db,
     gateway_requests::GatewayRequests,
-    host::{self, NativeRows, auth::AuthStore},
+    host::{
+        self, NativeRows,
+        auth::{AuthStore, JwtIo},
+    },
     license::build_license,
     periodic::{self, PeriodicJob},
 };
@@ -40,6 +43,8 @@ pub struct AppState {
     /// Where a virtual key is read from: the auth cache in front of the proxy's database. `None`
     /// without a database.
     pub keys: Option<Arc<AuthStore>>,
+    /// HTTP client and document cache for native JWT verification (JWKS, OIDC discovery, UserInfo).
+    pub jwt_io: Arc<JwtIo>,
     pub entitlements: Arc<Entitlements>,
     /// The proxy's `parallel_request_limiter_v3`, which the inference routes' callback stage runs
     /// and the limit check before the body asks.
@@ -110,11 +115,17 @@ impl AppState {
         let (keys, gateway_requests) = connected.unzip();
         let (gateway_requests, gateway_requests_flush) = gateway_requests.unzip();
         let entitlements = Arc::new(build_license(config, environment, resources).await);
+        let jwt_client = resources.core.pool.client(
+            &host::auth::jwt_client_config(&resources.http),
+            litellm_http::ClientVariant::Provider,
+        )?;
+        let jwt_io = Arc::new(JwtIo::new(jwt_client));
         Ok(Self {
             inference,
             redis,
             database,
             keys,
+            jwt_io,
             entitlements,
             key_limiter,
             spend_logs,
@@ -171,6 +182,7 @@ impl AppState {
         host::auth::auth_over(
             config,
             self.keys.clone(),
+            Some(self.jwt_io.clone()),
             self.entitlements.is_enterprise(),
             &*self.environment,
         )

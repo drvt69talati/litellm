@@ -4214,6 +4214,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "envy",
  "flate2",
@@ -4221,6 +4222,7 @@ dependencies = [
  "http-body-util",
  "hyper-util",
  "jiff",
+ "jsonwebtoken",
  "litellm-at-rest",
  "litellm-auth-store",
  "litellm-call-scope",
@@ -4268,6 +4270,7 @@ dependencies = [
  "litellm-token-counter",
  "litellm-tracing",
  "litellm-yaml",
+ "moka",
  "parking_lot",
  "rand 0.8.7",
  "rstest",

@@ -1,7 +1,10 @@
 //! Each file in `tests/admit/` is one config and the requests sent to the gateway built from it,
 //! each with who answers it, `rust` or `python`. A request for Python names the `reason` the client
 //! sees in `x-litellm-gateway`, and may name the setting or trait it goes to Python `over`.
+//! A request that names `jwt` claims carries them signed by a provider whose JWKS
+//! `JWT_PUBLIC_KEY_URL` names.
 
+mod jwt;
 mod keys;
 
 use std::{collections::BTreeMap, net::SocketAddr, path::Path, sync::Arc};
@@ -13,6 +16,7 @@ use axum::{
 };
 use litellm_config::{Config, Environment};
 use litellm_gateway::{StoredConfig, host::auth::AuthStore};
+use litellm_license::Entitlements;
 use litellm_model_catalog::{CostMap, IntegrityLimits};
 use litellm_repositories::StoredObjects;
 use rstest::rstest;
@@ -33,6 +37,9 @@ struct Scenario {
     /// Which other stored objects the database holds, when `stored` is `loaded`.
     #[serde(default)]
     held: Held,
+    /// Whether the deployment's license is an enterprise one, which JWT authentication needs.
+    #[serde(default)]
+    enterprise: bool,
     requests: Vec<Sent>,
 }
 
@@ -128,6 +135,21 @@ struct Sent {
     over: Option<String>,
     /// The client's TCP peer, which the IP allowlist reads.
     peer: Option<SocketAddr>,
+    /// Claims sent as a signed JWT bearer token.
+    jwt: Option<Jwt>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Jwt {
+    claims: serde_json::Map<String, serde_json::Value>,
+    /// Seconds from now until `exp`, negative for a token that has expired.
+    #[serde(default = "an_hour")]
+    expires_in: i64,
+}
+
+fn an_hour() -> i64 {
+    3600
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -153,8 +175,16 @@ impl Sent {
             (None, Some(raw)) => Body::from(raw.clone()),
             (None, None) => Body::empty(),
         };
+        let bearer = self.jwt.as_ref().map(|jwt| {
+            (
+                "authorization".to_owned(),
+                format!("Bearer {}", jwt::issue(&jwt.claims, jwt.expires_in)),
+            )
+        });
         self.headers
-            .iter()
+            .clone()
+            .into_iter()
+            .chain(bearer)
             .fold(
                 self.peer.into_iter().fold(
                     Request::builder()
@@ -204,6 +234,11 @@ impl Sent {
     "request_timeout_beside_router_request_timeout"
 )]
 #[case::pre_call_checks("pre_call_checks")]
+#[case::jwt("jwt")]
+#[case::jwt_team_claim("jwt_team_claim")]
+#[case::jwt_without_enterprise("jwt_without_enterprise")]
+#[case::jwt_beside_keys("jwt_beside_keys")]
+#[case::jwt_scope_based_access("jwt_scope_based_access")]
 #[tokio::test(flavor = "multi_thread")]
 async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     litellm_gateway::install_crypto_provider();
@@ -212,11 +247,19 @@ async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     let scenario: Scenario =
         serde_yaml_ng::from_value(litellm_yaml::from_str(&text).unwrap()).unwrap();
     let config = Config::from_value(scenario.config).unwrap();
-    let resources =
-        litellm_gateway::Resources::over(&config, Arc::new(|_: &str| None::<String>)).unwrap();
+    let jwks_url = jwt::serve_jwks().await;
+    let process = move |name: &str| (name == "JWT_PUBLIC_KEY_URL").then(|| jwks_url.clone());
+    let resources = litellm_gateway::Resources::over(&config, Arc::new(process)).unwrap();
     let state = litellm_gateway::AppState::over(&config, &Environment::default(), &resources)
         .await
         .unwrap();
+    let state = match scenario.enterprise {
+        false => state,
+        true => litellm_gateway::AppState {
+            entitlements: Arc::new(Entitlements::ServerVerified),
+            ..state
+        },
+    };
     let held = match scenario.keys.is_empty() {
         true => None,
         false => Some(listed(&scenario.keys, &scenario.tpm_limits).await),
