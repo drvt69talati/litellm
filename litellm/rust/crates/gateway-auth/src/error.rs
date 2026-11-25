@@ -3,7 +3,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use litellm_error::Source;
-use litellm_gateway_auth_core::{self as auth_core, KeyDenial, NotACaller};
+use litellm_gateway_auth_core::{
+    self as auth_core, AgentIdentityFailure, JwtDenial, KeyDenial, KeyFailure, NotACaller,
+    RbacDenial, TeamDenial, VerifyDenial,
+};
 
 #[derive(Debug, thiserror::Error, strum::IntoStaticStr)]
 pub enum Error {
@@ -71,6 +74,69 @@ impl From<auth_core::Error> for Error {
             )
             | auth_core::Error::PremiumRequired(_)
             | auth_core::Error::BudgetExceeded(_) => Self::Forbidden,
+            auth_core::Error::Jwt(ref denial) => match denial {
+                JwtDenial::Verify(VerifyDenial::Expired) => Self::Expired,
+                JwtDenial::Verify(VerifyDenial::Key(KeyFailure::Unreachable { .. }))
+                | JwtDenial::MappingRaceVanished { .. }
+                | JwtDenial::AgentIdentity(AgentIdentityFailure {
+                    policy_unavailable: true,
+                    ..
+                }) => Self::Unavailable(Source::new(error)),
+                JwtDenial::MappingNeedsDb { .. } | JwtDenial::CustomValidateUnavailable => {
+                    Self::Unconfigured
+                }
+                JwtDenial::Rbac(
+                    RbacDenial::UnmatchedRole
+                    | RbacDenial::RoleRoute { .. }
+                    | RbacDenial::RoleModel { .. }
+                    | RbacDenial::ScopeModel { .. },
+                )
+                | JwtDenial::Team(
+                    TeamDenial::TeamAliasAmbiguous { .. }
+                    | TeamDenial::NoTeamsInToken
+                    | TeamDenial::PassthroughRouteDenied { .. }
+                    | TeamDenial::RouteNotAllowed { .. }
+                    | TeamDenial::NoModelAccess { .. }
+                    | TeamDenial::HeaderTeamNotAllowed { .. }
+                    | TeamDenial::HeaderTeamNotMember { .. }
+                    | TeamDenial::HeaderTeamRouteNotAllowed { .. }
+                    | TeamDenial::NoMemberTeamHasModel { .. }
+                    | TeamDenial::NotTeamMember,
+                )
+                | JwtDenial::EmailDomainNotAllowed { .. }
+                | JwtDenial::CustomValidate
+                | JwtDenial::ManagedIssuerUntrusted
+                | JwtDenial::ManagedRouteNotAllowed
+                | JwtDenial::UnregisteredAgent { .. }
+                | JwtDenial::GrantingTeamRouteNotAllowed
+                | JwtDenial::NoObjectId
+                | JwtDenial::ManagedAgentNeedsDirectJwt
+                | JwtDenial::MappingClaimMissing { .. }
+                | JwtDenial::NoMapping { .. }
+                | JwtDenial::NoEligibleKey
+                | JwtDenial::AgentIdentity(AgentIdentityFailure {
+                    policy_unavailable: false,
+                    ..
+                }) => Self::Forbidden,
+                JwtDenial::Verify(
+                    VerifyDenial::Malformed(_)
+                    | VerifyDenial::Key(_)
+                    | VerifyDenial::Invalid(_)
+                    | VerifyDenial::Assertion(_)
+                    | VerifyDenial::UserinfoNotConfigured
+                    | VerifyDenial::IdJagNotBearer,
+                )
+                | JwtDenial::Rbac(RbacDenial::AdminRoute { .. })
+                | JwtDenial::Team(
+                    TeamDenial::TeamNotFound { .. }
+                    | TeamDenial::TeamAliasNotFound { .. }
+                    | TeamDenial::NoDb
+                    | TeamDenial::NoTeamInToken { .. },
+                )
+                | JwtDenial::Claim(_)
+                | JwtDenial::UserNotFound { .. }
+                | JwtDenial::UserDeactivated { .. } => Self::InvalidToken,
+            },
             auth_core::Error::Key(
                 KeyDenial::MissingKey
                 | KeyDenial::MalformedKey
@@ -80,8 +146,7 @@ impl From<auth_core::Error> for Error {
                 | KeyDenial::NotFound { .. }
                 | KeyDenial::Blocked
                 | KeyDenial::NoToken,
-            )
-            | auth_core::Error::Jwt(_) => Self::InvalidToken,
+            ) => Self::InvalidToken,
         }
     }
 }
@@ -146,6 +211,35 @@ mod tests {
     #[case::a_key_nothing_can_look_up(KeyDenial::NoDbConfigured.into(), "invalid_token")]
     #[case::an_unknown_key(not_found(), "invalid_token")]
     #[case::a_blocked_key(KeyDenial::Blocked.into(), "invalid_token")]
+    #[case::an_expired_jwt(JwtDenial::Verify(VerifyDenial::Expired).into(), "expired")]
+    #[case::an_unreachable_jwks(
+        JwtDenial::Verify(VerifyDenial::Key(KeyFailure::Unreachable {
+            error: "connection refused".to_owned(),
+        }))
+        .into(),
+        "unavailable"
+    )]
+    #[case::a_jwt_with_unmatched_role(JwtDenial::Rbac(RbacDenial::UnmatchedRole).into(), "forbidden")]
+    #[case::a_jwt_with_disallowed_team_route(
+        JwtDenial::Team(TeamDenial::RouteNotAllowed {
+            route: "/v1/messages".to_owned(),
+            team_id: "team-1".to_owned(),
+            model: "claude".to_owned(),
+        })
+        .into(),
+        "forbidden"
+    )]
+    #[case::a_jwt_with_missing_team(
+        JwtDenial::Team(TeamDenial::TeamNotFound {
+            team_id: "team-1".to_owned(),
+        })
+        .into(),
+        "invalid_token"
+    )]
+    #[case::a_jwt_with_unavailable_custom_validate(
+        JwtDenial::CustomValidateUnavailable.into(),
+        "unconfigured"
+    )]
     fn a_credential_the_core_did_not_authenticate_is_answered_in_this_servers_words(
         #[case] denied: auth_core::Error,
         #[case] answered: &str,

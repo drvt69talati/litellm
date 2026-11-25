@@ -3,11 +3,14 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use axum::http::request::Parts;
 use jiff::Timestamp;
 use litellm_gateway_auth_core::{
-    self as auth_core, AuthHost, Caller, Outcome, Rows, Settings, Token, authenticate_key,
+    self as auth_core, AuthHost, Caller, Outcome, Rows, Settings, Token, authenticate_jwt,
+    authenticate_key, plan::Plan,
 };
 use litellm_secret_value::SecretValue;
 
 use crate::{Authenticated, Bearer, CredentialExtractor, Error};
+
+const TEAM_HEADER: &str = "x-litellm-team-id";
 
 pub type AuthFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
 
@@ -81,16 +84,17 @@ impl<R: Rows> Auth<R> {
     }
 }
 
-/// Hands a credential to `gateway-auth-core`'s key path over the host `H`, which verifies the
-/// master key and reads the keys `H` holds. Every route this crate guards is an inference route,
-/// which is what the request it hands the core says.
-pub struct KeyAuthenticator<H> {
+/// Hands a credential to `gateway-auth-core` over the host `H`, letting `auth_core::plan` pick
+/// the key path or the JWT path and declining plans this server does not serve natively. Every
+/// route this crate guards is an inference route, which is what the request it hands the core
+/// says.
+pub struct CoreAuthenticator<H> {
     host: H,
     settings: Settings,
     clock: Arc<dyn Clock>,
 }
 
-impl<H> KeyAuthenticator<H> {
+impl<H> CoreAuthenticator<H> {
     pub fn new(host: H, settings: Settings, clock: Arc<dyn Clock>) -> Self {
         Self {
             host,
@@ -100,7 +104,16 @@ impl<H> KeyAuthenticator<H> {
     }
 }
 
-impl<H: AuthHost> Authenticator<H::Rows> for KeyAuthenticator<H> {
+fn team_header(parts: &Parts) -> Option<&str> {
+    parts
+        .headers
+        .get(TEAM_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+impl<H: AuthHost> Authenticator<H::Rows> for CoreAuthenticator<H> {
     fn authenticate<'a>(
         &'a self,
         credential: &'a Credential,
@@ -111,19 +124,424 @@ impl<H: AuthHost> Authenticator<H::Rows> for KeyAuthenticator<H> {
                 Credential::Token(presented) => Some(Token::new(presented.clone())),
                 Credential::Transport => None,
             };
-            let request = auth_core::Request {
+            let core_request = auth_core::Request {
                 route: request.uri.path(),
                 method: Some(&request.method),
                 token: token.as_ref(),
+                team_header: team_header(request),
                 is_llm_api_route: true,
                 runs_inference_checks: true,
                 now: self.clock.now(),
                 ..auth_core::Request::default()
             };
-            match authenticate_key(&self.host, &request, token.as_ref(), &self.settings).await {
+            let plan = auth_core::plan(&core_request, &self.settings)
+                .map_err(|premium| Error::from(auth_core::Error::from(premium)))?;
+            let outcome = match plan {
+                Plan::Key => {
+                    authenticate_key(&self.host, &core_request, token.as_ref(), &self.settings)
+                        .await
+                }
+                Plan::Jwt => authenticate_jwt(&self.host, &core_request, &self.settings).await,
+                Plan::Public
+                | Plan::OAuth2Introspection
+                | Plan::OAuth2Proxy
+                | Plan::JwtWithOperatorCode
+                | Plan::PassThroughOpen => return Err(Error::NotNative),
+            };
+            match outcome {
                 Ok(Outcome::Authenticated(identity)) => Ok(Caller::try_from(identity)?),
                 Ok(Outcome::Denied(error, _)) | Err(error) => Err(error.into()),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{convert::Infallible, time::Duration};
+
+    use axum::http::Request as HttpRequest;
+    use litellm_config::{GeneralSettings, LitellmRole};
+    use litellm_gateway_auth_core::{
+        AgentIdentityFailure, HostFacts, KeyHash, MasterKey, OperatorHooks, RouteGroups,
+        authn::{
+            jwt::{KeyMappingRow, KeyMappingWrite, MappedClaim, MappedKey},
+            key::{CachedTeam, KeyRecord, Keyed},
+        },
+        body::Params,
+        identity::{
+            jwt::{
+                AliasRead, DelegatedTeam, IdentityRead, ManagedAgent, ModelAccess, Org,
+                RegisteredAgent, TeamRead, UserLookup, UserRead,
+            },
+            key::Owner,
+        },
+    };
+    use rstest::rstest;
+    use serde_json::Value;
+
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct StubRows;
+
+    impl Rows for StubRows {
+        type Key = KeyRecord;
+        type User = ();
+        type Team = ();
+        type EndUser = ();
+        type ObjectPermission = Infallible;
+        type Project = ();
+        type Membership = ();
+        type Org = ();
+        type Agent = Infallible;
+    }
+
+    struct DecliningHost;
+
+    struct NoHooks;
+
+    impl OperatorHooks for NoHooks {
+        async fn custom_validate(&self, _: &Value) -> Result<bool, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+    }
+
+    impl AuthHost for DecliningHost {
+        type Rows = StubRows;
+
+        async fn cached_key(
+            &self,
+            _: &KeyHash,
+        ) -> Result<Option<Keyed<KeyRecord>>, auth_core::Error> {
+            Ok(None)
+        }
+        async fn db_key(
+            &self,
+            _: &KeyHash,
+            _: &(),
+        ) -> Result<Option<Keyed<KeyRecord>>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn key_by_hash(
+            &self,
+            _: &KeyHash,
+        ) -> Result<Option<MappedKey<KeyRecord>>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn key_mapping_hash(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<Option<KeyHash>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn reusable_key_hash(
+            &self,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<Option<KeyHash>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn ui_key(&self, _: &Token) -> Result<Option<Keyed<KeyRecord>>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn evict_key(&self, _: &KeyHash) -> Result<(), auth_core::Error> {
+            Ok(())
+        }
+        async fn fetch_json(&self, _: &str) -> Result<Option<Value>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn fetch_userinfo(
+            &self,
+            _: &str,
+            _: &Token,
+        ) -> Result<Option<Value>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn cached_document(&self, _: &str) -> Result<Option<Value>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn cache_document(
+            &self,
+            _: &str,
+            _: &Value,
+            _: Duration,
+        ) -> Result<(), auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn cached_key_mapping(
+            &self,
+            _: MappedClaim<'_>,
+        ) -> Result<Option<Value>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn cache_key_mapping(
+            &self,
+            _: MappedClaim<'_>,
+            _: &Value,
+            _: Duration,
+        ) -> Result<(), auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn forget_key_mapping(&self, _: MappedClaim<'_>) -> Result<(), auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        fn operator_hooks(&self) -> Option<&impl OperatorHooks> {
+            None::<&NoHooks>
+        }
+        async fn managed_agent(
+            &self,
+            _: &Value,
+        ) -> Result<Option<ManagedAgent<Infallible>>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn registered_agent(
+            &self,
+            _: &str,
+        ) -> Result<Option<RegisteredAgent>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn delegated_agent_team(
+            &self,
+            _: &DelegatedTeam<'_>,
+        ) -> Result<Option<String>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn key_owner(&self, _: &str) -> Result<Option<Owner<()>>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn user(&self, _: &UserLookup<'_>) -> Result<UserRead<()>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn resolve_user_identity(
+            &self,
+            _: &UserLookup<'_>,
+            _: Option<&str>,
+        ) -> Result<IdentityRead<StubRows>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn cached_team(&self, _: &str) -> Result<Option<CachedTeam<()>>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn key_team(&self, _: &str) -> Result<Option<()>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn team(&self, _: &str, _: bool) -> Result<TeamRead<()>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn granting_team(&self, _: &str) -> Result<TeamRead<()>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn team_by_alias(&self, _: &str) -> Result<AliasRead<()>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn load_team_membership(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<()>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn org(&self, _: &str) -> Result<Option<Org<()>>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn org_by_alias(&self, _: &str) -> Result<Option<Org<()>>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn jwt_end_user(&self, _: &str) -> Result<(), auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn end_user(&self, _: Option<&str>) -> Result<(), auth_core::Error> {
+            Ok(())
+        }
+        async fn validated_end_user_id(&self, _: &str) -> Result<Option<String>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn object_permission(&self, _: &str) -> Result<Option<Infallible>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn project(&self, _: &str) -> Result<Option<()>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn prefetch_identity(
+            &self,
+            _: Option<&Token>,
+            _: Option<&str>,
+        ) -> Result<(), auth_core::Error> {
+            Ok(())
+        }
+        async fn prefetch_auth_objects(
+            &self,
+            _: &KeyRecord,
+            _: &(),
+        ) -> Result<(), auth_core::Error> {
+            Ok(())
+        }
+        async fn set_user_role(&self, _: &(), _: LitellmRole) -> Result<(), auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn patch_team_membership(
+            &self,
+            _: &(),
+            _: &[String],
+            _: &[String],
+        ) -> Result<(), auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn normalize_model(&self, _: &KeyRecord) -> Result<(), auth_core::Error> {
+            Ok(())
+        }
+        async fn with_temp_budget(
+            &self,
+            key: Keyed<KeyRecord>,
+        ) -> Result<Keyed<KeyRecord>, auth_core::Error> {
+            Ok(key)
+        }
+        async fn key_skips_budget_checks(&self, _: &KeyRecord) -> Result<bool, auth_core::Error> {
+            Ok(false)
+        }
+        async fn team_model_access(
+            &self,
+            _: &(),
+            _: &str,
+        ) -> Result<ModelAccess, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn team_member_budget(
+            &self,
+            _: &KeyRecord,
+            _: Option<&()>,
+        ) -> Result<(), auth_core::Error> {
+            Ok(())
+        }
+        async fn key_budgets(
+            &self,
+            _: &KeyRecord,
+            _: Option<&()>,
+            _: bool,
+        ) -> Result<(), auth_core::Error> {
+            Ok(())
+        }
+        async fn jwt_user_model_budget(
+            &self,
+            _: &(),
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<(), auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn proxy_budget_alert(&self, _: &KeyRecord) -> Result<(), auth_core::Error> {
+            Ok(())
+        }
+        async fn record_agent_authentication(
+            &self,
+            agent: &Infallible,
+        ) -> Result<Option<AgentIdentityFailure>, auth_core::Error> {
+            match *agent {}
+        }
+        async fn add_team_member(&self, _: &str, _: &str) -> Result<(), auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn create_key_mapping(
+            &self,
+            _: &KeyMappingRow<'_>,
+        ) -> Result<KeyMappingWrite, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn with_team(&self, _: &KeyRecord, _: &()) -> Result<KeyRecord, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+        async fn credential(&self, _: &str) -> Result<Option<Params>, auth_core::Error> {
+            Err(auth_core::Error::HostDeclined)
+        }
+    }
+
+    fn settings(general: GeneralSettings, premium: bool) -> Settings {
+        Settings::new(
+            &general,
+            HostFacts {
+                master_key: Some(MasterKey::new("sk-master")),
+                premium,
+                has_db: false,
+                db_configured: false,
+                ui_login: false,
+                proxy_budget: false,
+                metrics_require_auth: true,
+                route_groups: RouteGroups::default(),
+            },
+            &|_| None,
+        )
+    }
+
+    fn parts(path: &str) -> Parts {
+        HttpRequest::post(path).body(()).unwrap().into_parts().0
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn jwt_without_enterprise_license_is_forbidden() {
+        let general = GeneralSettings {
+            enable_jwt_auth: true,
+            ..GeneralSettings::default()
+        };
+        let auth = CoreAuthenticator::new(
+            DecliningHost,
+            settings(general, false),
+            Arc::new(SystemClock),
+        );
+        let token = Credential::Token(SecretValue::from("a.b.c"));
+
+        let err = auth
+            .authenticate(&token, &parts("/v1/messages"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(<&'static str>::from(err), "forbidden");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn jwt_with_enterprise_license_dispatches_to_jwt_path() {
+        let general = GeneralSettings {
+            enable_jwt_auth: true,
+            ..GeneralSettings::default()
+        };
+        let auth = CoreAuthenticator::new(
+            DecliningHost,
+            settings(general, true),
+            Arc::new(SystemClock),
+        );
+        let token = Credential::Token(SecretValue::from("not-valid-base64.b.c"));
+
+        let err = auth
+            .authenticate(&token, &parts("/v1/messages"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(<&'static str>::from(err), "invalid_token");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn public_route_plan_declines_as_not_native() {
+        let config = litellm_config::Config::from_yaml(
+            "model_list: []\ngeneral_settings:\n  public_routes:\n    - /v1/messages\n",
+        )
+        .unwrap();
+        let auth = CoreAuthenticator::new(
+            DecliningHost,
+            settings(config.general_settings, true),
+            Arc::new(SystemClock),
+        );
+        let token = Credential::Token(SecretValue::from("sk-master"));
+
+        let err = auth
+            .authenticate(&token, &parts("/v1/messages"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(<&'static str>::from(err), "not_native");
     }
 }
