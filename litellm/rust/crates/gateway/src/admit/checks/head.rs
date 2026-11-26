@@ -11,6 +11,8 @@ use super::{Admit, Reason, Refused, config::messages_only};
 
 const MESSAGES: &str = "/v1/messages";
 const CALL_ID: &str = "x-litellm-call-id";
+/// The one proxy header the auth core reads, so the caller check decides on it.
+pub(super) const TEAM_HEADER: &str = "x-litellm-team-id";
 const FORWARDED_FOR: &str = "x-forwarded-for";
 const CLAUDE_CODE: [&str; 2] = ["claude-cli/", "claude-code/"];
 
@@ -39,10 +41,9 @@ pub(super) fn headers(admit: &Admit, request: &Parts) -> Option<Reason> {
     [
         (
             "proxy_header",
-            headers
-                .keys()
-                .map(|name| name.as_str())
-                .any(|name| name.starts_with("x-litellm-") && name != CALL_ID),
+            headers.keys().map(|name| name.as_str()).any(|name| {
+                name.starts_with("x-litellm-") && name != CALL_ID && name != TEAM_HEADER
+            }),
         ),
         ("content_encoding", headers.contains_key(CONTENT_ENCODING)),
         (
